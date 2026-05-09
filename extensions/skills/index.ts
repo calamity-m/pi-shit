@@ -1,5 +1,7 @@
-import { readFileSync } from "node:fs";
-import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, normalize, resolve } from "node:path";
+import { isToolCallEventType, type ExtensionAPI, type SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Focusable, type TUI } from "@earendil-works/pi-tui";
 
 type SortMode = "scope" | "name" | "tokens";
@@ -13,6 +15,31 @@ type SkillRow = {
 	tokens: number;
 };
 
+type SkillStats = {
+	userUsed: number;
+	agentLoaded: number;
+	lastUser?: string;
+	lastAgent?: string;
+	paths: string[];
+};
+
+type StatsFile = {
+	version: 1;
+	skills: Record<string, SkillStats>;
+};
+
+type SkillIndexEntry = {
+	name: string;
+	path: string;
+};
+
+type SkillIndex = {
+	byName: Map<string, SkillIndexEntry>;
+	byPath: Map<string, SkillIndexEntry>;
+};
+
+const STATS_PATH = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-shit", "skill-stats.json");
+
 function estimateTokens(value: string): number {
 	return Math.max(1, Math.ceil(value.length / 4));
 }
@@ -25,6 +52,56 @@ function readStatus(path: string): "on" | "user-only" {
 	} catch {
 		return "on";
 	}
+}
+
+function normalizePath(path: string, cwd: string): string {
+	return normalize(path.startsWith("/") ? path : resolve(cwd, path));
+}
+
+function readStats(): StatsFile {
+	try {
+		const parsed = JSON.parse(readFileSync(STATS_PATH, "utf8")) as StatsFile;
+		return parsed.version === 1 && parsed.skills ? parsed : { version: 1, skills: {} };
+	} catch {
+		return { version: 1, skills: {} };
+	}
+}
+
+function writeStats(stats: StatsFile): void {
+	mkdirSync(dirname(STATS_PATH), { recursive: true });
+	writeFileSync(STATS_PATH, `${JSON.stringify(stats, null, "\t")}\n`);
+}
+
+function recordSkill(name: string, path: string | undefined, kind: "user" | "agent"): void {
+	const stats = readStats();
+	const entry = stats.skills[name] ??= { userUsed: 0, agentLoaded: 0, paths: [] };
+	if (path && !entry.paths.includes(path)) entry.paths.push(path);
+
+	const now = new Date().toISOString();
+	if (kind === "user") {
+		entry.userUsed++;
+		entry.lastUser = now;
+	} else {
+		entry.agentLoaded++;
+		entry.lastAgent = now;
+	}
+
+	writeStats(stats);
+}
+
+function buildSkillIndex(pi: ExtensionAPI, cwd: string): SkillIndex {
+	const byName = new Map<string, SkillIndexEntry>();
+	const byPath = new Map<string, SkillIndexEntry>();
+
+	for (const command of pi.getCommands().filter((command) => command.source === "skill")) {
+		const name = command.name.replace(/^skill:/, "");
+		const path = normalizePath(command.sourceInfo.path, cwd);
+		const entry = { name, path };
+		byName.set(name, entry);
+		byPath.set(path, entry);
+	}
+
+	return { byName, byPath };
 }
 
 function scopeLabel(command: SlashCommandInfo): string {
@@ -206,6 +283,26 @@ class SkillsPanel implements Focusable {
 }
 
 export default function skillsExtension(pi: ExtensionAPI) {
+	pi.on("input", (event, ctx) => {
+		const match = event.text.match(/^\/skill:([^\s]+)(?:\s|$)/);
+		if (!match) return;
+
+		const skill = buildSkillIndex(pi, ctx.cwd).byName.get(match[1]);
+		if (!skill) return;
+
+		recordSkill(skill.name, skill.path, "user");
+	});
+
+	pi.on("tool_call", (event, ctx) => {
+		if (!isToolCallEventType("read", event)) return;
+
+		const path = normalizePath(event.input.path, ctx.cwd);
+		const skill = buildSkillIndex(pi, ctx.cwd).byPath.get(path);
+		if (!skill) return;
+
+		recordSkill(skill.name, skill.path, "agent");
+	});
+
 	pi.registerCommand("skills", {
 		description: "Browse available skills by source",
 		handler: async (_args, ctx) => {
