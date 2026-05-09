@@ -98,8 +98,9 @@ function expandPrompt(body: string, rawArgs: string): string {
 }
 
 function promptLabel(prompt: PromptTemplate): string {
-	const detail = prompt.argumentHint || prompt.description;
-	return detail ? `/${prompt.name} ${detail}` : `/${prompt.name}`;
+	const hint = prompt.argumentHint ? ` ${prompt.argumentHint}` : "";
+	const description = prompt.description ? ` — ${prompt.description}` : "";
+	return `/${prompt.name}${hint}${description}`;
 }
 
 export default function promptExtension(pi: ExtensionAPI) {

@@ -1,7 +1,8 @@
 ---
 description: Work a GitHub issue end-to-end from research to PR
-argument-hint: "<issue-url-or-#number> [extra instructions]"
+argument-hint: "<issue-url-or-#number>"
 ---
+
 Work this issue end-to-end.
 
 Issue / instructions:
