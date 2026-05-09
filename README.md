@@ -21,6 +21,8 @@ Keep extensions directory-based so loose TypeScript files do not pile up.
 pi -e .
 ```
 
+Tip: set `quietStartup: true` in Pi settings if you want the custom dashboard header without Pi's built-in startup resource listing.
+
 ## Extensions
 
 - `/pi-shit` confirms the package is loaded.
