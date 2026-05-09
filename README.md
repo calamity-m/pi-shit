@@ -25,6 +25,7 @@ pi -e .
 
 - `/pi-shit` confirms the package is loaded.
 - `/context` shows a Claude Code-style context report: current usage, system prompt size, context files, skills, tools, prompt templates, extension commands, and largest session entries.
+- `/skills` opens a temporary searchable browser of available skills grouped by source.
 
 ## Install locally
 
