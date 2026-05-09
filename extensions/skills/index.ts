@@ -143,19 +143,20 @@ class SkillsPanel implements Focusable {
 	private scroll = 0;
 	private query = "";
 	private searchActive = false;
-	private statsVisible = false;
 	private sort: SortMode = "scope";
 
 	constructor(
 		private skills: SkillRow[],
 		private tui: TUI,
 		private theme: any,
-		private done: () => void,
+		private done: (command: string | null) => void,
 	) {}
 
 	handleInput(data: string): void {
 		if (this.searchActive) {
-			if (matchesKey(data, "escape") || matchesKey(data, "return")) {
+			if (matchesKey(data, "return")) {
+				this.selectSkill();
+			} else if (matchesKey(data, "escape")) {
 				this.searchActive = false;
 			} else if (matchesKey(data, "backspace")) {
 				this.query = this.query.slice(0, -1);
@@ -171,7 +172,7 @@ class SkillsPanel implements Focusable {
 		}
 
 		if (matchesKey(data, "escape") || data === "q") {
-			this.done();
+			this.done(null);
 			return;
 		}
 		if (data === "/") this.searchActive = true;
@@ -182,7 +183,7 @@ class SkillsPanel implements Focusable {
 		else if (matchesKey(data, "ctrl+d")) this.move(10);
 		else if (matchesKey(data, "home")) this.selected = 0;
 		else if (matchesKey(data, "end")) this.selected = Math.max(0, this.filtered().length - 1);
-		else if (matchesKey(data, "return")) this.statsVisible = !this.statsVisible;
+		else if (matchesKey(data, "return")) this.selectSkill();
 		else return;
 
 		this.keepSelectionVisible();
@@ -195,7 +196,7 @@ class SkillsPanel implements Focusable {
 		const selectedSkill = rows[this.selected];
 		const groups = this.groupRows(rows);
 		const header = ` Skills`;
-		const help = ` ${this.skills.length} skills · / search · t sort (${this.sort}) · ↑/↓ move · Enter usage · Esc/q close`;
+		const help = ` ${this.skills.length} skills · / search · t sort (${this.sort}) · ↑/↓ move · Enter insert · Esc/q close`;
 		const searchText = this.query || "Search skills…";
 		const border = (text: string) => th.fg("border", text);
 		const innerWidth = Math.max(20, width - 4);
@@ -228,17 +229,16 @@ class SkillsPanel implements Focusable {
 
 		lines.push("");
 		if (selectedSkill) {
+			const stats = selectedSkill.stats;
 			lines.push(th.fg("accent", ` ${selectedSkill.name}`));
 			lines.push(truncateToWidth(` ${selectedSkill.description || "No description"}`, width, ""));
 			lines.push(th.fg("dim", truncateToWidth(` ${selectedSkill.path}`, width, "")));
-			if (this.statsVisible) {
-				const stats = selectedSkill.stats;
-				lines.push("");
-				lines.push(th.fg("accent", " Usage"));
-				lines.push(truncateToWidth(` user selected: ${stats.userUsed} · last: ${formatSeen(stats.lastUser)}`, width, ""));
-				lines.push(truncateToWidth(` agent loaded:  ${stats.agentLoaded} · last: ${formatSeen(stats.lastAgent)}`, width, ""));
-				lines.push(th.fg("dim", truncateToWidth(` tracked paths: ${stats.paths.length ? stats.paths.join(", ") : "none"}`, width, "")));
-			}
+			lines.push(truncateToWidth(` scope: ${selectedSkill.scope} · status: ${selectedSkill.status} · prompt cost: ~${selectedSkill.tokens} tokens`, width, ""));
+			lines.push("");
+			lines.push(th.fg("accent", " Usage"));
+			lines.push(truncateToWidth(` user selected: ${stats.userUsed} · last: ${formatSeen(stats.lastUser)}`, width, ""));
+			lines.push(truncateToWidth(` agent loaded:  ${stats.agentLoaded} · last: ${formatSeen(stats.lastAgent)}`, width, ""));
+			lines.push(th.fg("dim", truncateToWidth(` tracked paths: ${stats.paths.length ? stats.paths.join(", ") : "none"}`, width, "")));
 		} else {
 			lines.push(th.fg("dim", " No matching skills"));
 		}
@@ -283,6 +283,11 @@ class SkillsPanel implements Focusable {
 		this.sort = this.sort === "scope" ? "name" : this.sort === "name" ? "tokens" : "scope";
 		this.selected = 0;
 		this.scroll = 0;
+	}
+
+	private selectSkill(): void {
+		const skill = this.filtered()[this.selected];
+		if (skill) this.done(`/skill:${skill.name} `);
 	}
 
 	private keepSelectionVisible(): void {
@@ -333,9 +338,14 @@ export default function skillsExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-				return new SkillsPanel(skills, tui, theme, () => done());
+			const command = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+				return new SkillsPanel(skills, tui, theme, done);
 			});
+
+			if (command) {
+				ctx.ui.setEditorText(command);
+				ctx.ui.notify("Skill command loaded. Add instructions and submit when ready.", "info");
+			}
 		},
 	});
 }
