@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import { CURSOR_MARKER, Key, matchesKey, truncateToWidth, wrapTextWithAnsi, type EditorComponent, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 type PromptTemplate = {
@@ -103,9 +104,204 @@ function promptLabel(prompt: PromptTemplate): string {
 	return `/${prompt.name}${hint}${description}`;
 }
 
+type FillField = {
+	tokens: string[];
+	label: string;
+	value: string;
+};
+
+function detectFillFields(body: string, initialArgs: string): FillField[] {
+	const fields = new Map<string, FillField>();
+	const positional = splitArgs(initialArgs);
+	const hasRawArguments = /\$(?:ARGUMENTS|@)(?![A-Za-z0-9_])/.test(body);
+
+	if (hasRawArguments) {
+		const rawField = { tokens: ["$ARGUMENTS", "$@"], label: "$ARGUMENTS", value: initialArgs };
+		fields.set("$ARGUMENTS", rawField);
+		fields.set("$@", rawField);
+	}
+
+	for (const match of body.matchAll(/\$([1-9][0-9]*)/g)) {
+		const token = match[0];
+		const index = Number(match[1]);
+		if (!fields.has(token)) fields.set(token, { tokens: [token], label: token, value: positional[index - 1] ?? "" });
+	}
+
+	for (const match of body.matchAll(/\$\{@:([0-9]+)(?::([0-9]+))?\}/g)) {
+		const token = match[0];
+		const start = Math.max(0, Number(match[1]) - 1);
+		const length = match[2] === undefined ? undefined : Math.max(0, Number(match[2]));
+		if (!fields.has(token)) fields.set(token, { tokens: [token], label: token, value: positional.slice(start, length === undefined ? undefined : start + length).join(" ") });
+	}
+
+	return [...new Set(fields.values())];
+}
+
+function expandVisualPrompt(body: string, fields: FillField[]): string {
+	let text = body;
+	const replacements = fields.flatMap((field) => field.tokens.map((token) => ({ token, value: field.value })));
+	for (const replacement of replacements.sort((a, b) => b.token.length - a.token.length)) {
+		text = text.replaceAll(replacement.token, replacement.value);
+	}
+	return text;
+}
+
+const FILL_CONTEXT_LINES_BEFORE = 5;
+const FILL_CONTEXT_LINES_AFTER = 8;
+
+class PromptFillEditor implements EditorComponent, Focusable {
+	focused = false;
+	onSubmit?: (text: string) => void;
+	onChange?: (text: string) => void;
+	private active = 0;
+
+	constructor(
+		private readonly tui: TUI,
+		private readonly prompt: PromptTemplate,
+		private readonly body: string,
+		private readonly fields: FillField[],
+		private readonly theme: ExtensionCommandContext["ui"]["theme"],
+		private readonly done: (result: string | undefined) => void,
+	) {}
+
+	getText(): string {
+		return expandVisualPrompt(this.body, this.fields);
+	}
+
+	setText(_text: string): void {}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.done(undefined);
+			return;
+		}
+		if (matchesKey(data, Key.shift("tab"))) {
+			this.active = Math.max(0, this.active - 1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, Key.tab) || matchesKey(data, Key.enter)) {
+			this.advance();
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			const field = this.fields[this.active];
+			field.value = [...field.value].slice(0, -1).join("");
+			this.onChange?.(this.getText());
+			this.tui.requestRender();
+			return;
+		}
+
+		const paste = data.match(/^\x1b\[200~([\s\S]*)\x1b\[201~$/)?.[1];
+		if (paste !== undefined) {
+			this.fields[this.active].value += paste;
+			this.onChange?.(this.getText());
+			this.tui.requestRender();
+			return;
+		}
+
+		if (data.length > 0 && !data.startsWith("\x1b")) {
+			this.fields[this.active].value += data;
+			this.onChange?.(this.getText());
+			this.tui.requestRender();
+		}
+	}
+
+	render(width: number): string[] {
+		const pane = this.renderBodyPane();
+		const border = this.theme.fg("border", "─".repeat(Math.max(0, width)));
+		const lines = [
+			border,
+			truncateToWidth(this.theme.fg("accent", `Filling /${this.prompt.name} (${this.active + 1}/${this.fields.length}): ${this.fields[this.active].label}`), width),
+			truncateToWidth(this.theme.fg("dim", "Type to fill highlighted variable • tab/enter next • shift+tab previous • esc cancel"), width),
+			"",
+		];
+		if (pane.start > 0) lines.push(truncateToWidth(this.theme.fg("dim", `… ${pane.start} lines above hidden`), width));
+		for (const line of pane.lines) lines.push(...wrapTextWithAnsi(line, width));
+		if (pane.end < pane.total) lines.push(truncateToWidth(this.theme.fg("dim", `… ${pane.total - pane.end} lines below hidden`), width));
+		lines.push(border);
+		return lines;
+	}
+
+	private advance(): void {
+		if (this.active < this.fields.length - 1) {
+			this.active++;
+			this.tui.requestRender();
+			return;
+		}
+		const finalText = this.getText();
+		this.onSubmit?.(finalText);
+		this.done(finalText);
+	}
+
+	private renderBodyPane(): { lines: string[]; start: number; end: number; total: number } {
+		const sourceLines = this.body.split("\n");
+		const activeField = this.fields[this.active];
+		const activeLine = Math.max(0, sourceLines.findIndex((line) => activeField.tokens.some((token) => line.includes(token))));
+		const start = Math.max(0, activeLine - FILL_CONTEXT_LINES_BEFORE);
+		const end = Math.min(sourceLines.length, activeLine + FILL_CONTEXT_LINES_AFTER + 1);
+		return {
+			lines: sourceLines.slice(start, end).map((line) => this.renderBodyLine(line)),
+			start,
+			end,
+			total: sourceLines.length,
+		};
+	}
+
+	private renderBodyLine(line: string): string {
+		const fieldsByToken = new Map(this.fields.flatMap((field) => field.tokens.map((token) => [token, field] as const)));
+		const activeField = this.fields[this.active];
+		let rendered = "";
+		let index = 0;
+
+		for (const match of line.matchAll(/\$ARGUMENTS|\$@|\$[1-9][0-9]*|\$\{@:[0-9]+(?::[0-9]+)?\}/g)) {
+			const token = match[0];
+			const start = match.index ?? 0;
+			rendered += this.theme.fg("dim", line.slice(index, start));
+
+			const field = fieldsByToken.get(token);
+			if (!field) {
+				rendered += this.theme.fg("dim", token);
+			} else if (field !== activeField) {
+				rendered += this.theme.fg("muted", field.value || `⟦${field.label}⟧`);
+			} else {
+				const text = field.value || `⟦${field.label}⟧`;
+				rendered += this.theme.bg("selectedBg", this.theme.fg("accent", `${text}${this.focused ? CURSOR_MARKER : ""} `));
+			}
+
+			index = start + token.length;
+		}
+
+		rendered += this.theme.fg("dim", line.slice(index));
+		return rendered;
+	}
+}
+
+async function fillPromptVisually(ctx: ExtensionCommandContext, prompt: PromptTemplate, initialArgs: string): Promise<string | undefined> {
+	const fields = detectFillFields(prompt.body, initialArgs);
+	if (fields.length === 0) return prompt.body;
+
+	if (!process.stdout.isTTY) {
+		const label = prompt.argumentHint ? `Arguments for /${prompt.name}: ${prompt.argumentHint}` : `Arguments for /${prompt.name}`;
+		const multilineArgs = await ctx.ui.editor(label, initialArgs);
+		return multilineArgs === undefined ? undefined : expandPrompt(prompt.body, multilineArgs.trim());
+	}
+
+	const previousEditor = ctx.ui.getEditorComponent();
+	try {
+		return await new Promise<string | undefined>((resolve) => {
+			ctx.ui.setEditorComponent((tui) => new PromptFillEditor(tui, prompt, prompt.body, fields, ctx.ui.theme, resolve));
+		});
+	} finally {
+		ctx.ui.setEditorComponent(previousEditor);
+	}
+}
+
 export default function promptExtension(pi: ExtensionAPI) {
 	pi.registerCommand("prompt", {
-		description: "Pick a prompt template, collect multiline arguments, and fill the editor",
+		description: "Pick a prompt template, visually fill variables, and populate the editor",
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const prompts = pi.getCommands().filter((command) => command.source === "prompt");
 			const items = prompts
@@ -131,11 +327,10 @@ export default function promptExtension(pi: ExtensionAPI) {
 			}
 
 			const initialArgs = prompt.name === requestedName || `/${prompt.name}` === requestedName ? rest.join(" ") : args;
-			const label = prompt.argumentHint ? `Arguments for /${prompt.name}: ${prompt.argumentHint}` : `Arguments for /${prompt.name}`;
-			const multilineArgs = await ctx.ui.editor(label, initialArgs);
-			if (multilineArgs === undefined) return;
+			const filled = await fillPromptVisually(ctx, prompt, initialArgs.trim());
+			if (filled === undefined) return;
 
-			ctx.ui.setEditorText(expandPrompt(prompt.body, multilineArgs.trim()));
+			ctx.ui.setEditorText(filled);
 			ctx.ui.notify(`Filled editor from /${prompt.name}`, "info");
 		},
 	});
